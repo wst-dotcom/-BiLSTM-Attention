@@ -1,0 +1,196 @@
+import re
+import pandas as pd
+import numpy as np
+import jieba
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import tensorflow as tf
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Embedding, LSTM, Bidirectional, Dense, Dropout, Layer
+from tensorflow.keras.callbacks import EarlyStopping
+
+# -------------------------------
+# 1. 数据读取函数（正负样本）
+# -------------------------------
+def read_review_file(file_path, label, encoding="utf-8"):
+    with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
+        data = f.read()
+    pattern = re.compile(r'<review.*?>(.*?)</review>', re.S)
+    matches = pattern.findall(data)
+    texts = []
+    for text in matches:
+        text_clean = "\n".join([line.strip() for line in text.strip().splitlines() if line.strip()])
+        if text_clean:
+            texts.append(text_clean)
+    labels = [label] * len(texts)
+    return texts, labels
+
+# -------------------------------
+# 2. 中文分词函数
+# -------------------------------
+def chinese_tokenize(text):
+    return " ".join(jieba.lcut(text))
+
+# -------------------------------
+# 3. Attention 层
+# -------------------------------
+class Attention(Layer):
+    def __init__(self, **kwargs):
+        super(Attention, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.W = self.add_weight(name="att_weight", shape=(input_shape[-1], 1),
+                                 initializer="normal")
+        self.b = self.add_weight(name="att_bias", shape=(input_shape[1], 1),
+                                 initializer="zeros")
+        super(Attention, self).build(input_shape)
+
+    def call(self, x):
+        # x: [batch_size, timesteps, features]
+        e = tf.keras.backend.tanh(tf.keras.backend.dot(x, self.W) + self.b)
+        a = tf.keras.backend.softmax(e, axis=1)
+        output = tf.keras.backend.sum(a * x, axis=1)
+        return output
+
+# -------------------------------
+# 4. 准备训练数据（示例路径，修改为你的训练集路径）
+# -------------------------------
+cn_neg_file = r"D:\zuoye\商品评价文本情感分类\训练集\evaltask2_sample_data\cn_sample_data\sample.negative.txt"
+cn_pos_file = r"D:\zuoye\商品评价文本情感分类\训练集\evaltask2_sample_data\cn_sample_data\sample.positive.txt"
+en_neg_file = r"D:\zuoye\商品评价文本情感分类\训练集\evaltask2_sample_data\en_sample_data\sample.negative.txt"
+en_pos_file = r"D:\zuoye\商品评价文本情感分类\训练集\evaltask2_sample_data\en_sample_data\sample.positive.txt"
+
+cn_neg_text, cn_neg_label = read_review_file(cn_neg_file, 0, "utf-8")
+cn_pos_text, cn_pos_label = read_review_file(cn_pos_file, 1, "utf-8")
+en_neg_text, en_neg_label = read_review_file(en_neg_file, 0, "latin1")
+en_pos_text, en_pos_label = read_review_file(en_pos_file, 1, "latin1")
+
+train_texts = cn_neg_text + cn_pos_text + en_neg_text + en_pos_text
+train_labels = cn_neg_label + cn_pos_label + en_neg_label + en_pos_label
+
+# 中文分词
+train_texts = [chinese_tokenize(t) for t in train_texts]
+
+# -------------------------------
+# 5. 文本序列化
+# -------------------------------
+tokenizer = Tokenizer()
+tokenizer.fit_on_texts(train_texts)
+sequences = tokenizer.texts_to_sequences(train_texts)
+max_len = 500  # 限制最大长度
+padded_sequences = pad_sequences(sequences, maxlen=max_len, padding='post')
+labels = np.array(train_labels)
+
+# 划分训练/验证集
+X_train, X_val, y_train, y_val = train_test_split(
+    padded_sequences, labels, test_size=0.1, random_state=42, shuffle=True
+)
+
+vocab_size = len(tokenizer.word_index) + 1
+
+# -------------------------------
+# 6. 构建 BiLSTM + Attention 模型
+# -------------------------------
+input_layer = Input(shape=(max_len,))
+embedding_layer = Embedding(input_dim=vocab_size, output_dim=128, input_length=max_len)(input_layer)
+bilstm = Bidirectional(LSTM(64, return_sequences=True))(embedding_layer)
+attention = Attention()(bilstm)
+dense1 = Dense(64, activation='relu')(attention)
+dropout = Dropout(0.5)(dense1)
+output_layer = Dense(1, activation='sigmoid')(dropout)
+
+model = Model(inputs=input_layer, outputs=output_layer)
+model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+model.summary()
+
+# -------------------------------
+# 7. 模型训练
+# -------------------------------
+early_stop = EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True)
+
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    batch_size=32,
+    epochs=10,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+# -------------------------------
+# 8. 测试集评估函数
+# -------------------------------
+def read_test_dataset(file_path, encoding="utf-8"):
+    with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
+        data = f.read()
+    pattern = re.compile(r'<review id="(\d+)"\s+label="(\d+)">(.*?)</review>', re.S)
+    matches = pattern.findall(data)
+    texts, labels = [], []
+    for _, label, text in matches:
+        text_clean = "\n".join([line.strip() for line in text.strip().splitlines() if line.strip()])
+        texts.append(chinese_tokenize(text_clean))
+        labels.append(int(label))
+    return texts, np.array(labels)
+
+# 示例：测试集
+cn_file = r"D:\zuoye\商品评价文本情感分类\测试集标注\Sentiment Classification with Deep Learning\test.label.cn.txt"
+en_file = r"D:\zuoye\商品评价文本情感分类\测试集标注\Sentiment Classification with Deep Learning\test.label.en.txt"
+
+test_cn_texts, test_cn_labels = read_test_dataset(cn_file, "utf-8")
+test_en_texts, test_en_labels = read_test_dataset(en_file, "utf-8")
+
+test_cn_seq = pad_sequences(tokenizer.texts_to_sequences(test_cn_texts), maxlen=max_len, padding='post')
+test_en_seq = pad_sequences(tokenizer.texts_to_sequences(test_en_texts), maxlen=max_len, padding='post')
+
+# 评估
+def evaluate_model(test_seq, test_labels, lang="CN"):
+    preds = (model.predict(test_seq) > 0.5).astype(int)
+    print(f"\n===== {lang} 测试集分类性能 =====")
+    print(confusion_matrix(test_labels, preds))
+    print(classification_report(test_labels, preds))
+
+evaluate_model(test_cn_seq, test_cn_labels, "CN")
+evaluate_model(test_en_seq, test_en_labels, "EN")
+
+
+import matplotlib.pyplot as plt
+
+# Accuracy 曲线
+plt.figure()
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.title("Accuracy Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Loss 曲线
+plt.figure()
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title("Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+def plot_confusion(test_seq, test_labels, lang="CN"):
+    preds = (model.predict(test_seq) > 0.5).astype(int)
+    cm = confusion_matrix(test_labels, preds)
+    plt.figure(figsize=(4,3))
+    sns.heatmap(cm, annot=True, cmap="Blues", fmt="d")
+    plt.title(f"Confusion Matrix - {lang} Test Set")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.show()
+
+plot_confusion(test_cn_seq, test_cn_labels, "CN")
+plot_confusion(test_en_seq, test_en_labels, "EN")
